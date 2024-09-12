@@ -2,6 +2,8 @@
 #include <thread>
 #include <chrono>
 #include <Windows.h>
+#include <list>
+#include <string>
 
 #include <opencv2/opencv.hpp>
 
@@ -17,15 +19,23 @@ extern "C" {
 }
 
 
-const char* filter_descr = "select='gt(scene,0.11)'";
+const char* filter_descr = "select='gt(scene,0.15)'";
 
-static AVFormatContext* fmt_ctx;
+static AVFormatContext* fmt_ctx = NULL;
 static AVCodecContext* dec_ctx;
+static AVCodecContext* dec_ctx2;
 AVFilterContext* buffersink_ctx;
 AVFilterContext* buffersrc_ctx;
-AVFilterGraph* filter_graph;
+AVFilterGraph* filter_graph = NULL;
 static int video_stream_index = -1;
+static int audio_stream_index = -1;
 static int64_t last_pts = AV_NOPTS_VALUE;
+static std::vector<std::string> files;
+const char* input_dir = ".";
+char frames_output_dir[MAX_PATH];
+char mp4_backup_dir[MAX_PATH];
+
+int processed_file_count = 0;
 
 static cv::Mat AVFrame_to_CvMat(const AVFrame* input_avframe)
 {
@@ -61,15 +71,17 @@ static cv::Mat AVFrame_to_CvMat(const AVFrame* input_avframe)
         avFrameToOpenCVBGRSwsContext = nullptr;
     }
 
-    cv::Mat resizedMat(image_height / 2, image_width / 2, CV_8UC3);
-    cv::resize(resMat, resizedMat, cv::Size(image_width / 2, image_height / 2));
+    //cv::Mat resizedMat(image_height / 2, image_width / 2, CV_8UC3);
+    //cv::resize(resMat, resizedMat, cv::Size(image_width / 2, image_height / 2));
 
-    return resizedMat;
+    //return resizedMat;
+    return resMat;
 }
 
 static int open_input_file(const char* filename)
 {
     const AVCodec* dec;
+    const AVCodec* dec2;
     int ret;
 
     if ((ret = avformat_open_input(&fmt_ctx, filename, NULL, NULL)) < 0) {
@@ -102,6 +114,26 @@ static int open_input_file(const char* filename)
         return ret;
     }
 
+    /* select the video stream */
+    ret = av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, &dec2, 0);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot find a audio stream in the input file\n");
+        return ret;
+    }
+    audio_stream_index = ret;
+
+    /* create decoding context */
+    dec_ctx2 = avcodec_alloc_context3(dec2);
+    if (!dec_ctx2)
+        return AVERROR(ENOMEM);
+    avcodec_parameters_to_context(dec_ctx2, fmt_ctx->streams[audio_stream_index]->codecpar);
+
+    /* init the video decoder */
+    if ((ret = avcodec_open2(dec_ctx2, dec2, NULL)) < 0) {
+        av_log(NULL, AV_LOG_ERROR, "Cannot open audio decoder\n");
+        return ret;
+    }
+
     return 0;
 }
 
@@ -115,7 +147,7 @@ static int init_filters(const char* filters_descr)
     AVFilterInOut* inputs = avfilter_inout_alloc();
     AVRational time_base = fmt_ctx->streams[video_stream_index]->time_base;
     enum AVPixelFormat pix_fmts[] = { AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
-
+     
     filter_graph = avfilter_graph_alloc();
     if (!outputs || !inputs || !filter_graph) {
         ret = AVERROR(ENOMEM);
@@ -217,31 +249,44 @@ static void display_frame(const AVFrame* frame, AVRational time_base, const char
     cv::waitKey(wait);
 }
 
-void save_frame(const AVFrame* frame, const char* path, int shot_index, int frame_index, int first_0_last_1)
+std::string get_file_name(const char* full_path)
+{
+    int pos = std::string(full_path).find_last_of('\\');
+    if (pos != -1)
+        return std::string(full_path + pos + 1);
+
+    return "";
+}
+
+void save_frame(const AVFrame* frame, const char* path, const char* video_file, int shot_index, int frame_index)
 {
     cv::Mat mat = AVFrame_to_CvMat(frame);
 
+    std::string file_name = get_file_name(video_file);
     char file[1024];
-    sprintf_s(file, 1024, "%s\\shot_%06d.%s.%06d.png", path, shot_index, first_0_last_1 == 0 ? "first" : "last", frame_index);
+    sprintf_s(file, 1024, "%s\\%s_shot_%08d_frame_%010d_pts_%016I64d.png", path, file_name.c_str(), shot_index, frame_index, frame->pts);
     cv::imwrite(file, mat);
-
-    std::cout << file << std::endl;
 }
 
-std::string create_shots_directory(const char* video_file)
+void load_file_names(const char* dir)
 {
-    std::string file(video_file);
-    int last = file.find_last_of('\\');
+    std::string filter = dir;
+    filter += "\\*.mp4";
+    WIN32_FIND_DATA data;
+    HANDLE h = ::FindFirstFile(filter.c_str(), &data);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do {
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                continue;
 
-    char dir[1024];
-    sprintf_s(dir, 1024, "%s\\shots", file.substr(0, last).c_str());
-    ::CreateDirectory(dir, NULL);
-    sprintf_s(dir, 1024, "%s\\shots\\%s", file.substr(0, last).c_str(), file.substr(last + 1).c_str());
-    ::CreateDirectory(dir, NULL);
-    sprintf_s(dir, 1024, "%s\\shots\\%s\\origin", file.substr(0, last).c_str(), file.substr(last + 1).c_str());
-    ::CreateDirectory(dir, NULL);
+            files.push_back(std::string(input_dir) + "\\" + data.cFileName);
+            if (files.size() >= 10)
+                break;
+        } while (FindNextFile(h, &data));
+    }
 
-    return std::string(dir);
+    FindClose(h);
 }
 
 int main(int argc, char** argv)
@@ -253,14 +298,19 @@ int main(int argc, char** argv)
     AVFrame* filt_frame;
     int frame_index = 1;
     int shot_index = 1;
-    std::string dir;
+    int shot_frames_count = 0;
+    char frames_output_dir[MAX_PATH];
 
     if (argc != 2) {
-        fprintf(stderr, "Usage: %s file\n", argv[0]);
+        fprintf(stderr, "Usage: %s input_dir\n", argv[0]);
         exit(1);
     }
 
-    dir = create_shots_directory(argv[1]);
+    input_dir = argv[1];
+    sprintf_s(frames_output_dir, MAX_PATH, "%s\\%s", input_dir, "frames");
+    ::CreateDirectory(frames_output_dir, NULL);
+    sprintf_s(mp4_backup_dir, MAX_PATH, "%s\\%s", input_dir, "mp4_done");
+    ::CreateDirectory(mp4_backup_dir, NULL);
 
     frame = av_frame_alloc();
     filt_frame = av_frame_alloc();
@@ -270,15 +320,48 @@ int main(int argc, char** argv)
         exit(1);
     }
 
-    if ((ret = open_input_file(argv[1])) < 0)
-        goto end;
-    if ((ret = init_filters(filter_descr)) < 0)
-        goto end;
-
     /* read all packets */
     while (1) {
+        if (fmt_ctx == NULL)
+        {
+            if (files.empty())
+            {
+                load_file_names(input_dir);
+                if (files.empty())
+                {
+                    Sleep(500);
+                    continue;
+                }
+            }
+
+            if ((ret = open_input_file(files.begin()->c_str())) < 0)
+                goto end;
+
+            frame_index = 1;
+        }
+
+        if (filter_graph == NULL)
+        {
+            if ((ret = init_filters(filter_descr)) < 0)
+                goto end;
+        }
+
         if ((ret = av_read_frame(fmt_ctx, packet)) < 0)
-            break;
+        {
+            avformat_close_input(&fmt_ctx);
+            fmt_ctx = NULL;
+
+            std::string file_name = get_file_name(files.begin()->c_str());
+            ::MoveFile(files.begin()->c_str(), (std::string(mp4_backup_dir) + "\\" + file_name).c_str());
+            files.erase(files.begin());
+
+            processed_file_count++;
+            std::cout << processed_file_count << ". " << file_name << std::endl;
+            if (processed_file_count > 10000)
+                break;
+
+            continue;
+        }
 
         if (packet->stream_index == video_stream_index) {
             ret = avcodec_send_packet(dec_ctx, packet);
@@ -300,10 +383,7 @@ int main(int argc, char** argv)
                 frame->pts = frame->best_effort_timestamp;
                 
                 // 调试显示帧图像
-                //display_frame(frame, dec_ctx->time_base, "img", 1);
-
-                if (frame_index == 1)
-                    save_frame(frame, dir.c_str(), shot_index, frame_index, 0);
+                display_frame(frame, dec_ctx->time_base, "img", 1);
 
                 /* push the decoded frame into the filtergraph */
                 if (av_buffersrc_add_frame_flags(buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {
@@ -319,16 +399,11 @@ int main(int argc, char** argv)
                     if (ret < 0)
                         goto end;
 
-                    // 保存上一镜头尾帧
-                    save_frame(last_frame, dir.c_str(), shot_index, frame_index - 1, 1);
-
-                    // 保存新镜头首帧
                     shot_index++;
-                    save_frame(frame, dir.c_str(), shot_index, frame_index, 0);
+                    shot_frames_count = 0;
 
                     // 调试显示新的分镜头图像
-                    //display_frame(filt_frame, buffersink_ctx->inputs[0]->time_base, "filter", 1);
-
+                    display_frame(filt_frame, buffersink_ctx->inputs[0]->time_base, "filter", 1);
                     av_frame_unref(filt_frame);
                 }
 
@@ -338,7 +413,36 @@ int main(int argc, char** argv)
                 last_frame = av_frame_clone(frame);
                 av_frame_unref(frame);
 
+                if (shot_frames_count >= 1500)
+                {
+                    shot_index++;
+                    shot_frames_count = 0;
+                }
+                
+                save_frame(last_frame, frames_output_dir, files.begin()->c_str(), shot_index, frame_index);
+                shot_frames_count++;
                 frame_index++;
+            }
+        }
+        else if (packet->stream_index == audio_stream_index)
+        {
+            ret = avcodec_send_packet(dec_ctx2, packet);
+            if (ret < 0) {
+                av_log(NULL, AV_LOG_ERROR, "Error while sending a packet to the decoder\n");
+                break;
+            }
+            while (ret >= 0) {
+                ret = avcodec_receive_frame(dec_ctx2, frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    break;
+                }
+                else if (ret < 0) {
+                    av_log(NULL, AV_LOG_ERROR, "Error while receiving a frame from the decoder\n");
+                    goto end;
+                }
+
+                frame->pts = frame->best_effort_timestamp;
+                av_frame_unref(frame);
             }
         }
         av_packet_unref(packet);
@@ -346,13 +450,13 @@ int main(int argc, char** argv)
 end:
     avfilter_graph_free(&filter_graph);
     avcodec_free_context(&dec_ctx);
+    avcodec_free_context(&dec_ctx2);
     avformat_close_input(&fmt_ctx);
     av_frame_free(&frame);
     av_frame_free(&filt_frame);
 
     if (last_frame != NULL)
     {
-        save_frame(last_frame, dir.c_str(), shot_index, frame_index - 1, 1); // 保存最后一副图
         av_frame_free(&last_frame);
     }
 
