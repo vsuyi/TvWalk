@@ -270,6 +270,8 @@ void save_frame(const AVFrame* frame, const char* path, const char* video_file, 
 
 void load_file_names(const char* dir)
 {
+    files.clear();
+
     std::string filter = dir;
     filter += "\\*.mp4";
     WIN32_FIND_DATA data;
@@ -324,10 +326,10 @@ int main(int argc, char** argv)
     while (1) {
         if (fmt_ctx == NULL)
         {
-            if (files.empty())
+            if (files.size() <= 1)
             {
                 load_file_names(input_dir);
-                if (files.empty())
+                if (files.size() <= 1)
                 {
                     Sleep(500);
                     continue;
